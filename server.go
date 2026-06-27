@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/cryptobyte"
@@ -128,6 +130,10 @@ type Listener struct {
 	chanConn chan net.Conn
 	chanErr  chan error
 	logger   logrus.FieldLogger
+
+	// 防 ClientHello 重放：记录已使用的 x25519 公钥 → 过期时间戳
+	seenRandoms   map[[32]byte]int64
+	seenRandomsMu sync.Mutex
 }
 
 func Listen(laddr string, config *ServerConfig) (net.Listener, error) {
@@ -136,12 +142,14 @@ func Listen(laddr string, config *ServerConfig) (net.Listener, error) {
 		return nil, err
 	}
 	l := &Listener{
-		Listener: inner,
-		config:   config,
-		chanConn: make(chan net.Conn),
-		chanErr:  make(chan error),
-		logger:   GetLogger(config.Debug),
+		Listener:    inner,
+		config:      config,
+		chanConn:    make(chan net.Conn),
+		chanErr:     make(chan error, 1), // 缓冲避免 Accept 关闭时发送阻塞
+		logger:      GetLogger(config.Debug),
+		seenRandoms: make(map[[32]byte]int64),
 	}
+	go l.cleanupSeenRandoms()
 
 	go func() {
 		for {
@@ -173,236 +181,325 @@ func (l *Listener) Accept() (net.Conn, error) {
 	return nil, <-l.chanErr
 }
 
-// handshake 尝试处理私有握手,失败则进行客户端和代理目标转发，成功返回加密包装后的客户端连接
+// handshake 尝试处理私有握手，失败则透明代理到伪装目标，成功返回加密连接。
+//
+// 时序分析（防主动探测）：
+// 非授权连接走 fail 路径时，额外耗时 = Dial(目标) + 密码学。
+// Dial RTT 典型 5-50ms；密码学部分（x25519 ECDH + AES-GCM + HKDF）合计 <0.2ms，
+// 完全淹没在网络抖动中。攻击者要区分 REALITY 代理与直连目标，需在同网段测量
+// 目标的 RTT 基线并大量采样，实际利用成本极高。
 func (l *Listener) handshake(clientConn net.Conn) (net.Conn, error) {
 	logger := l.logger
+
+	// [1] 连接伪装目标
 	targetConn, err := net.Dial("tcp", l.config.SNIAddr)
 	if err != nil {
+		clientConn.Close()
 		return nil, errors.Join(ErrProxyDie, err)
 	}
-	// bufio.Reader是为了在读数据时，不是一个一个record读取，而是模仿一次性读取尽可能多的record
-	// io.TeeReader是为了在读数据时，同时互相转发
-	clientReader := bufio.NewReader(io.TeeReader(clientConn, targetConn))
-	targetReader := bufio.NewReader(io.TeeReader(targetConn, clientConn))
-	var aead cipher.AEAD
-	var plaintext []byte
-	readClientHello := func() error {
-		recordClientHello, err := readTlsRecord(clientReader)
-		if err != nil {
-			return err
-		}
-		var random, sessionId []byte
-		s := cryptobyte.String(recordClientHello.recordData)
-		if !s.Skip(6) || // skip type(1) length(3) version(2)
-			!s.ReadBytes(&random, 32) ||
-			!s.ReadUint8LengthPrefixed((*cryptobyte.String)(&sessionId)) ||
-			len(sessionId) != 32 {
-			return fmt.Errorf("invalid client hello: %x", hex.EncodeToString(recordClientHello.recordData))
-		}
-		logger.Debugf("random(public for ecdh): %x", random)
-		logger.Debugf("sessionId(ciphertext): %x", sessionId)
-		pub, err := ecdh.X25519().NewPublicKey(random)
-		if err != nil {
-			return err
-		}
-		sessionKey, err := l.config.privateKeyECDH.ECDH(pub)
-		if err != nil {
-			return err
-		}
-		logger.Debugf("sessionKey: %x", sessionKey)
 
-		block, err := aes.NewCipher(sessionKey)
-		if err != nil {
-			return err
-		}
-		aead, err = cipher.NewGCMWithNonceSize(block, 8)
-		if err != nil {
-			return err
-		}
-		nonce, err := generateNonce(aead.NonceSize(), sessionKey, l.config.ExpireSecond)
-		if err != nil {
-			return err
-		}
-		logger.Debugf("nonce: %x", nonce)
-
-		plaintext, err = aead.Open(nil, nonce, sessionId, nil)
-		if err != nil {
-			return err
-		}
-		logger.Debugf("plaintext: %x", plaintext)
-
-		if !bytes.HasPrefix(plaintext, Prefix) {
-			return fmt.Errorf("invalid prefix: %x", plaintext[:len(Prefix)])
-		}
-		logger.Debug("handshake ok")
-		return nil
-	}
-	if err = readClientHello(); err != nil {
-		go dup(clientConn, targetConn)
-		return nil, errors.Join(ErrVerifyFailed, err)
-	}
-
-	if _, err = serverOrder1.wait(targetReader, logger); err != nil {
+	fail := func(err error) (net.Conn, error) {
 		go dup(clientConn, targetConn)
 		return nil, err
 	}
 
-	if _, err = clientOrder.wait(clientReader, logger); err != nil {
-		go dup(clientConn, targetConn)
-		return nil, err
-	}
-	records, err := serverOrder2.wait(targetReader, logger)
+	// [2] 建立双向 TeeReader 观察者
+	fo := newFlightObserver(clientConn, targetConn)
+
+	// [3] 解密 REALITY 握手
+	result, err := l.readClientHello(fo.clientReader, logger)
 	if err != nil {
-		go dup(clientConn, targetConn)
-		return nil, err
+		return fail(errors.Join(ErrVerifyFailed, err))
 	}
-	// 客户端和代理目标的tls握手已经完成，可以关闭目标的连接
-	targetConn.Close()
 
-	// 获取模拟目标的seq，如果有的话
+	// [4] 观察 TLS 握手
+	records, err := observeTLS(fo)
+	if err != nil {
+		return fail(err)
+	}
+
+	// [5] 提取 seq
 	seq := [8]byte{}
 	copy(seq[:], seqNumerOne[:])
 	if len(records) > 0 {
-		record := records[len(records)-1]
-		recordData := record.recordData
-		if len(recordData) > len(seq) {
-			copy(seq[:], recordData[:len(seq)])
+		rd := records[len(records)-1].recordData
+		if len(rd) > len(seq) {
+			copy(seq[:], rd[:len(seq)])
 		}
 	}
 	logger.Debugf("seqNumer: %x", seq)
-	incSeq(seq[:])
 
-	// 读取客户端发送的附加内容
-	record, err := readTlsRecord(clientConn)
+	// [6] 读取 overlay 数据
+	overlayRecord, err := readTlsRecord(fo.overlayReader())
 	if err != nil {
+		fo.targetConn.Close()
 		return nil, err
 	}
-	overlayData := record.recordData[len(record.recordData)-1]
+	overlayData := overlayRecord.recordData[len(overlayRecord.recordData)-1]
 	logger.Debugf("overlayData: %x", overlayData)
+	fo.targetConn.Close()
 
-	// 发送服务端签名
-	sign := ed25519.Sign(ed25519.PrivateKey(l.config.privateKeySign), plaintext)
+	// [7] 发送服务端签名（同样使用 900-1400B 大包，参见 generateRandomData）
+	sign := ed25519.Sign(ed25519.PrivateKey(l.config.privateKeySign), result.plaintext)
 	logger.Debugf("sign: %x", sign)
-	record = newTLSRecord(
-		recordTypeApplicationData, versionTLS12,
-		generateRandomData(append(seq[:], sign...)), // record数据前缀模仿seq
-	)
-	if _, err = record.writeTo(clientConn); err != nil {
+	signRecord := newTLSRecord(recordTypeApplicationData, versionTLS12,
+		generateRandomData(append(seq[:], sign...)))
+	if _, err := signRecord.writeTo(clientConn); err != nil {
 		clientConn.Close()
 		return nil, err
 	}
-	return newWarpConn(clientConn, aead, overlayData, seq), nil
+
+	// [8] 返回加密连接
+	return newWarpConn(clientConn, result.aead, overlayData, seq, fo.isTLS13), nil
 }
 
-// dup 转发两个连接
-func dup(clientConn net.Conn, proxyConn net.Conn) {
-	defer clientConn.Close()
-	defer proxyConn.Close()
-	go io.Copy(proxyConn, clientConn)
-	io.Copy(clientConn, proxyConn)
+// —— 类型定义 ——
+
+type handshakeResult struct {
+	aead      cipher.AEAD
+	plaintext []byte
 }
 
-type recordOrders []struct {
-	recordType    byte
-	handshakeType byte
-	optional      bool
+type flightObserver struct {
+	clientConn   net.Conn
+	targetConn   net.Conn
+	clientReader *bufio.Reader
+	targetReader *bufio.Reader
+
+	records  []*tlsRecord // 收集的服务端 records
+	buffered *tlsRecord   // 可选状态不匹配时暂存
+	isTLS13  bool         // 目标是否协商了 TLS 1.3
 }
 
-var serverOrder1 = recordOrders{
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeServerHello,
-	},
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeCertificate,
-	},
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeServerKeyExchange,
-	},
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeServerHelloDone,
-	},
+func newFlightObserver(clientConn, targetConn net.Conn) *flightObserver {
+	return &flightObserver{
+		clientConn:   clientConn,
+		targetConn:   targetConn,
+		clientReader: bufio.NewReader(io.TeeReader(clientConn, targetConn)),
+		targetReader: bufio.NewReader(io.TeeReader(targetConn, clientConn)),
+	}
 }
 
-var clientOrder = recordOrders{
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeCertificate,
-		optional:      true,
-	},
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeClientKeyExchange,
-	},
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeCertificateVerify,
-		optional:      true,
-	},
-	{
-		recordType: recordTypeChangeCipherSpec,
-	},
-	{
-		recordType: recordTypeHandshake, // Encrypted Handshake Message(Finished)
-	},
+func (f *flightObserver) overlayReader() io.Reader {
+	if f.clientReader.Buffered() >= recordHeaderLen {
+		return f.clientReader
+	}
+	return f.clientConn
 }
 
-var serverOrder2 = recordOrders{
-	{
-		recordType:    recordTypeHandshake,
-		handshakeType: typeNewSessionTicket,
-		optional:      true,
-	},
-	{
-		recordType: recordTypeChangeCipherSpec,
-	},
-	{
-
-		recordType: recordTypeHandshake, // Encrypted Handshake Message(Finished)
-	},
+func (f *flightObserver) readTarget() (*tlsRecord, error) {
+	if f.buffered != nil {
+		r := f.buffered
+		f.buffered = nil
+		return r, nil
+	}
+	return readTlsRecord(f.targetReader)
 }
 
-func (orders recordOrders) wait(reader io.Reader, logger logrus.FieldLogger) ([]*tlsRecord, error) {
-	records := make([]*tlsRecord, 0, len(orders))
-	orderPos := 0
-	for {
-		record, err := readTlsRecord(reader)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, record)
-		for pos := orderPos; pos < len(orders); pos++ {
-			o := orders[pos]
-			if o.handshakeType != 0 {
-				// 需要判断握手类型
-				if len(record.recordData) != 0 &&
-					record.recordData[0] == o.handshakeType {
-					orderPos = pos + 1
-					break
-				}
-			} else {
-				orderPos = pos + 1
-				break
+func (f *flightObserver) readClient() (*tlsRecord, error) {
+	if f.buffered != nil {
+		r := f.buffered
+		f.buffered = nil
+		return r, nil
+	}
+	return readTlsRecord(f.clientReader)
+}
+
+func (f *flightObserver) buffer(r *tlsRecord) { f.buffered = r }
+func (f *flightObserver) keep(r *tlsRecord)   { f.records = append(f.records, r) }
+
+func (f *flightObserver) drainTarget() {
+	// goroutine 持续读 targetReader，TeeReader 自动转发到客户端。
+	// FSM 同期只读 clientReader，不冲突。handshake() 关闭 targetConn 时 goroutine 退出。
+	go func() {
+		for {
+			r, err := readTlsRecord(f.targetReader)
+			if err != nil {
+				return
 			}
+			f.keep(r)
+		}
+	}()
+}
 
-			if o.optional {
-				// 如果当前类型是可选的，继续向下查找
-				logger.Debugf("try optional record: %+v", record)
-				orderPos = pos + 1
-				continue
-			} else {
-				return nil, fmt.Errorf(
-					"invalid record, want %+v, got %d %x,",
-					o, record.recordType, record.recordData,
-				)
-			}
-		}
-		if orderPos == len(orders) {
-			return records, nil
-		}
+func (l *Listener) readClientHello(clientReader *bufio.Reader, logger logrus.FieldLogger) (*handshakeResult, error) {
+	recordClientHello, err := readTlsRecord(clientReader)
+	if err != nil {
+		return nil, err
+	}
+	var random, sessionId []byte
+	s := cryptobyte.String(recordClientHello.recordData)
+	if !s.Skip(6) || !s.ReadBytes(&random, 32) ||
+		!s.ReadUint8LengthPrefixed((*cryptobyte.String)(&sessionId)) {
+		return nil, fmt.Errorf("invalid client hello: %x", hex.EncodeToString(recordClientHello.recordData))
+	}
+	logger.Debugf("random(public for ecdh): %x", random)
+	logger.Debugf("sessionId(ciphertext): %x", sessionId)
+
+	pub, err := ecdh.X25519().NewPublicKey(random)
+	if err != nil {
+		return nil, err
+	}
+	sessionKey, err := l.config.privateKeyECDH.ECDH(pub)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debugf("sessionKey: %x", sessionKey)
+	block, err := aes.NewCipher(sessionKey)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCMWithNonceSize(block, 8)
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := generateNonce(aead.NonceSize(), sessionKey, l.config.ExpireSecond)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debugf("nonce: %x", nonce)
+
+	// SessionId 长度检查放至 crypto 之后——无论长度是否匹配，先执行等量计算，消除时序 oracle
+	if len(sessionId) != 32 {
+		dummy := make([]byte, 32)
+		aead.Open(nil, nonce, dummy, nil)
+		return nil, fmt.Errorf("invalid session id length: %d", len(sessionId))
 	}
 
+	plaintext, err := aead.Open(nil, nonce, sessionId, nil)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debugf("plaintext: %x", plaintext)
+	if !bytes.HasPrefix(plaintext, Prefix) {
+		return nil, fmt.Errorf("invalid prefix: %x", plaintext[:len(Prefix)])
+	}
+	// 防重放：检查 x25519 公钥（即 Random）是否已被使用
+	if err := l.checkReplay(random); err != nil {
+		return nil, err
+	}
+	logger.Debug("handshake ok")
+	return &handshakeResult{aead: aead, plaintext: plaintext}, nil
+}
+
+// cleanupSeenRandoms 定期清理已过期的公钥记录，防止 map 无限增长。
+func (l *Listener) cleanupSeenRandoms() {
+	ticker := time.NewTicker(time.Duration(l.config.ExpireSecond) * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now().Unix()
+		l.seenRandomsMu.Lock()
+		for k, exp := range l.seenRandoms {
+			if exp < now {
+				delete(l.seenRandoms, k)
+			}
+		}
+		l.seenRandomsMu.Unlock()
+	}
+}
+
+// checkReplay 检查 x25519 公钥是否已被使用，防止 ClientHello 重放探测。
+// 必须放在所有密码学验证通过之后调用，避免侧信道泄漏。
+func (l *Listener) checkReplay(random []byte) error {
+	if len(random) != 32 {
+		return nil // 不应出现，防御性放过
+	}
+	now := time.Now().Unix()
+	key := *(*[32]byte)(random)
+
+	l.seenRandomsMu.Lock()
+	defer l.seenRandomsMu.Unlock()
+
+	if exp, ok := l.seenRandoms[key]; ok && exp > now {
+		return ErrReplay
+	}
+	// 保留 ExpireSecond*2 时长，容忍时钟偏差
+	l.seenRandoms[key] = now + int64(l.config.ExpireSecond)*2
+	return nil
+}
+
+// —— 状态机 ——
+
+var serverFSM = map[handshakeState]stateHandler{
+	stateServerHello:  consumeServerHello,
+	stateSrvSKX:       state(matchRule{htype: typeServerKeyExchange}, stateSrvSHD),
+	stateSrvSHD:       state(matchRule{htype: typeServerHelloDone}, stateClientCert),
+	stateSrvTicket:    state(matchRule{htype: typeNewSessionTicket, optional: true}, stateSrvCCS),
+	stateSrvCCS:       state(matchRule{rtype: recordTypeChangeCipherSpec}, stateSrvFinished),
+	stateSrvFinished:  state(matchRule{rtype: recordTypeHandshake}, stateDone),
+	stateSrvCCS13:     state(matchRule{rtype: recordTypeChangeCipherSpec, optional: true}, stateSrvAppData13),
+	stateSrvAppData13: state(matchRule{rtype: recordTypeApplicationData, greedy: true}, stateClientCCS13),
+}
+
+var clientFSM = map[handshakeState]stateHandler{
+	stateClientCert:      state(matchRule{htype: typeCertificate, optional: true, fromClient: true}, stateClientCKX),
+	stateClientCKX:       state(matchRule{htype: typeClientKeyExchange, fromClient: true}, stateClientCertVfy),
+	stateClientCertVfy:   state(matchRule{htype: typeCertificateVerify, optional: true, fromClient: true}, stateClientCCS),
+	stateClientCCS:       state(matchRule{rtype: recordTypeChangeCipherSpec, fromClient: true}, stateClientFinished),
+	stateClientFinished:  state(matchRule{rtype: recordTypeHandshake, fromClient: true}, stateSrvTicket),
+	stateClientCCS13:     state(matchRule{rtype: recordTypeChangeCipherSpec, optional: true, fromClient: true}, stateClientAppData13),
+	stateClientAppData13: state(matchRule{rtype: recordTypeApplicationData, fromClient: true}, stateDone),
+}
+
+// consumeServerHello 读首条 ServerHello，处理 HRR，返回 next 状态。
+func consumeServerHello(fo *flightObserver) (handshakeState, error) {
+	first, err := readTlsRecord(fo.targetReader)
+	if err != nil {
+		return stateDone, err
+	}
+
+	msgs := first.handshakeMsgs
+	if len(msgs) == 0 || msgs[0].msgType != typeServerHello {
+		return stateDone, fmt.Errorf("expected ServerHello, got %x", first.recordData[:min(4, len(first.recordData))])
+	}
+
+	// HRR 也是 ServerHello（msgType=2），通过 Random 字段值区分
+	if isHRR(msgs[0]) {
+		fo.isTLS13 = true
+		readTlsRecord(fo.clientReader) // CCS
+		readTlsRecord(fo.clientReader) // CH2
+		next, _ := readTlsRecord(fo.targetReader)
+		if next.recordType == recordTypeChangeCipherSpec {
+			first, _ = readTlsRecord(fo.targetReader)
+		} else {
+			first = next
+		}
+		msgs = first.handshakeMsgs
+	}
+
+	if len(msgs) > 1 {
+		for _, m := range msgs[1:] {
+			fo.keep(&tlsRecord{recordType: recordTypeHandshake, version: versionTLS12, recordData: m.data})
+		}
+		return stateClientCert, nil
+	}
+
+	next, err := readTlsRecord(fo.targetReader)
+	if err != nil {
+		return stateDone, err
+	}
+	if next.recordType == recordTypeChangeCipherSpec || next.recordType == recordTypeApplicationData {
+		fo.isTLS13 = true
+		fo.buffer(next)
+		return stateSrvCCS13, nil
+	}
+	fo.keep(next)
+	return stateSrvSKX, nil
+}
+
+func observeTLS(fo *flightObserver) ([]*tlsRecord, error) {
+	state := handshakeState(stateServerHello)
+	for state != stateDone {
+		fsm := serverFSM
+		if !isServerState(state) {
+			fsm = clientFSM
+		}
+		var err error
+		state, err = fsm[state](fo)
+		if err != nil {
+			go dup(fo.clientConn, fo.targetConn)
+			return nil, err
+		}
+	}
+	return fo.records, nil
 }

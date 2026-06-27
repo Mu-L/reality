@@ -48,23 +48,31 @@ reality是安全传输层的实现，其和TLS类似都实现了安全传输，�
 
 限制：
 
-只能使用TLS1.3，且必须使用x25519
+只能使用 TLS 1.2 或 TLS 1.3，且必须使用 x25519
 
-1. key_share是TLS1.3新增内容<https://www.rfc-editor.org/rfc/rfc8446#section-4.2.8>
-1. reality服务端返回的临时证书本质上是有特征的，但TLS1.3中Certificate包是加密的，也就规避了这一问题
-1. 如果伪装服务器目标不使用x25519，则私有握手无法成功
+1. key_share 是 TLS 1.3 新增内容 <https://www.rfc-editor.org/rfc/rfc8446#section-4.2.8>；对于 TLS 1.2，使用 Client Hello 的 Random 字段替代
+1. reality 服务端返回的临时签名通过 AES-GCM 加密的 Application Data record 传输，规避特征
+1. 如果伪装服务器目标不支持 x25519 或 AEAD 密码套件，则私有握手无法成功
 
 
-## 与原版的reality的区别
+## 与原版 REALITY 的区别
 
-1. 使用两组预共享公私钥，分别用于密钥交换/验签，验签使用额外一次通信进行
-2. 模仿站必须是tls1.2，且最好使用aead的套件
-    1. TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
-    1. TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
-    1. TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-    1. TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-    1. TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-    1. TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-    1. TLS_RSA_WITH_AES_128_GCM_SHA256
-    1. TLS_RSA_WITH_AES_256_GCM_SHA384
-3. 服务端代码实现更简单，不需要修改tls库，用读写过滤的方式来判断是否已经握手完成
+1. 使用**两组**预共享公私钥（x25519 用于密钥交换，ed25519 用于验签），验签使用额外一次通信进行
+2. 模仿站支持 **TLS 1.2 和 TLS 1.3**，推荐使用 AEAD 密码套件：
+
+   **TLS 1.2:**
+   - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+   - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+   - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+   - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+   - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+   - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+   - TLS_RSA_WITH_AES_128_GCM_SHA256
+   - TLS_RSA_WITH_AES_256_GCM_SHA384
+
+   **TLS 1.3:**
+   - TLS_AES_128_GCM_SHA256
+   - TLS_AES_256_GCM_SHA384
+   - TLS_CHACHA20_POLY1305_SHA256
+
+3. 服务端代码实现更简单，不需要修改 TLS 库，通过 `io.TeeReader` 双向转发方式监听握手完成状态

@@ -74,6 +74,10 @@ var cipherSuites = map[uint16]bool{
 	utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: true,
 	utls.TLS_RSA_WITH_AES_128_GCM_SHA256:         true,
 	utls.TLS_RSA_WITH_AES_256_GCM_SHA384:         true,
+	// TLS 1.3
+	utls.TLS_AES_128_GCM_SHA256:       true,
+	utls.TLS_AES_256_GCM_SHA384:       true,
+	utls.TLS_CHACHA20_POLY1305_SHA256: true,
 }
 
 func (c *gen) check() error {
@@ -87,8 +91,8 @@ func (c *gen) check() error {
 	logger.Infoln("connected")
 	state := conn.ConnectionState()
 	logger.Infof("version: %s, ciphersuite: %s", utls.VersionName(state.Version), utls.CipherSuiteName(state.CipherSuite))
-	if state.Version != utls.VersionTLS12 {
-		return errors.New("server must use tls 1.2")
+	if state.Version != utls.VersionTLS12 && state.Version != utls.VersionTLS13 {
+		return fmt.Errorf("server must use tls 1.2 or 1.3, got %s", utls.VersionName(state.Version))
 	}
 
 	useAead := cipherSuites[state.CipherSuite]

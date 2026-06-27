@@ -33,31 +33,23 @@ type sessionManager struct {
 }
 
 func (s *sessionManager) createSession(conn net.Conn, id byte) {
-	if s.isSessionOpen(id) {
+	s.sessionsLock[id].Lock()
+	defer s.sessionsLock[id].Unlock()
+	// 加锁后重新检查,防止 TOCTOU 竞态
+	if s.sessions[id] != nil && !s.sessions[id].IsClosed() {
 		s.logger.Errorf("client(id:%d) session already open, close %s", id, conn.RemoteAddr())
 		conn.Close()
 		return
 	}
-	s.sessionsLock[id].Lock()
-	defer s.sessionsLock[id].Unlock()
 	session, err := yamux.Server(conn, nil)
 	if err != nil {
 		s.logger.Error(err)
 		conn.Close()
+		return
 	}
 	go s.checkSession(id, session)
 	s.sessions[id] = session
 	s.logger.Infof("client(id:%d) session opened %s", id, conn.RemoteAddr())
-}
-
-func (s *sessionManager) isSessionOpen(id byte) bool {
-	s.sessionsLock[id].Lock()
-	defer s.sessionsLock[id].Unlock()
-	session := s.sessions[id]
-	if session != nil {
-		return !session.IsClosed()
-	}
-	return false
 }
 
 func (s *sessionManager) openClientSessionStream(id byte) (*yamux.Stream, error) {

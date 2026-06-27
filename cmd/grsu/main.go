@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -18,6 +19,7 @@ type serverSession struct {
 	config  *reality.ClientConfig
 	session *yamux.Session
 	logger  logrus.FieldLogger
+	mu      sync.Mutex
 }
 
 func newServerSession(config *reality.ClientConfig, logger logrus.FieldLogger) *serverSession {
@@ -50,19 +52,29 @@ func (s *serverSession) connect() {
 		return
 	}
 	defer session.Close()
+	s.mu.Lock()
 	s.session = session
+	s.mu.Unlock()
 	logger.Infof("session opened %s", client.RemoteAddr())
 	<-session.CloseChan()
+	s.mu.Lock()
+	s.session = nil
+	s.mu.Unlock()
 	logger.Infof("session closed %s", client.RemoteAddr())
 }
 
 func (s *serverSession) openSessionStream() (*yamux.Stream, error) {
+	s.mu.Lock()
+	session := s.session
+	s.mu.Unlock()
 
-	if s.session != nil {
-		stream, err := s.session.OpenStream()
+	if session != nil {
+		stream, err := session.OpenStream()
 		if err != nil {
-			s.session.Close()
+			session.Close()
+			s.mu.Lock()
 			s.session = nil
+			s.mu.Unlock()
 			return nil, err
 		}
 		return stream, nil

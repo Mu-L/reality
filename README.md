@@ -5,7 +5,7 @@
 1. grsu(Golang Reverse SOCKS5 User) 用户端，需要运行于用户机器上，提供socks5服务
 
 
-grs是一个反向socks5代理,其中grss和grsc和grsu是通过REALITY协议通信
+grs 是一个反向 SOCKS5 代理，基于 REALITY 协议，grss/grsc/grsu 间所有通信伪装成对真实 HTTPS 站点的 TLS 1.2/1.3 连接，消除网络特征和防止主动探测
 
 关于REALITY协议: [README-REALITY.md](./README-REALITY.md)
 

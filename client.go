@@ -185,7 +185,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (net.Conn, error) {
 		&utls.Config{
 			ServerName:             config.SNI,
 			SessionTicketsDisabled: true,
-			MaxVersion:             utls.VersionTLS12,
+			MaxVersion:             utls.VersionTLS13,
 			InsecureSkipVerify:     config.SkipVerify,
 		},
 		*config.fingerPrint,
@@ -198,6 +198,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (net.Conn, error) {
 	// 将临时公钥和加密数据发送给服务器，分别占用的Random和SessionId
 	hello := uconn.HandshakeState.Hello
 	hello.Random = priv.PublicKey().Bytes()
+	hello.Random[31] |= byte(randomUint16()) & 0x80 // 高位随机化，消除线路上 X25519 偏差
 	hello.SessionId = ciphertext
 
 	// 已经做好私有握手准备，此时相关数据如下
@@ -213,11 +214,15 @@ func NewClient(ctx context.Context, config *ClientConfig) (net.Conn, error) {
 	}
 	state := uconn.ConnectionState()
 	logger.Debugf("version: %s,cipher: %s", utls.VersionName(state.Version), utls.CipherSuiteName(state.CipherSuite))
-	is12 := state.Version == versionTLS12
-	if is12 {
+	isTLS13 := state.Version == utls.VersionTLS13
+	isSupported := isTLS13 || state.Version == versionTLS12
+	if isSupported {
 		// 进行我们私有握手，客户端发送附加数据，服务端回复64字节签名数据
 		logger.Debugf("overlayData: %x", config.OverlayData)
-		// record数据前缀模仿seq
+		// 私有握手：客户端发送 overlay 大包（900-1400B），服务端回复签名。
+		// 此处故意使用大 record 而非小包——内层隧道 TLS 握手小包密集，
+		// 先发大包可扰乱 DPI 对 record 大小的统计分析，见 generateRandomData。
+		// record 前缀模仿 seq
 		data := generateRandomData(seqNumerOne[:])
 		data[len(data)-1] = config.OverlayData
 		record := newTLSRecord(recordTypeApplicationData, versionTLS12, data)
@@ -227,6 +232,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (net.Conn, error) {
 		}
 		record, err = readTlsRecord(uconn.GetUnderlyingConn())
 		if err != nil {
+			uconn.Close()
 			return nil, err
 		}
 		if record.recordType != recordTypeApplicationData {
@@ -250,7 +256,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (net.Conn, error) {
 		}
 		// 服务端回复验证通过
 		logger.Debugln("verify ok")
-		return newWarpConn(uconn.GetUnderlyingConn(), aead, config.OverlayData, seqNumerOne), nil
+		return newWarpConn(uconn.GetUnderlyingConn(), aead, config.OverlayData, seqNumerOne, isTLS13), nil
 	}
 	uconn.Close()
 	return nil, ErrVerifyFailed
