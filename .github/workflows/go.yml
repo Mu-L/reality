@@ -25,6 +25,7 @@ jobs:
     - name: Build
       run: |
         go install github.com/go-bindata/go-bindata/...@latest
+        export PATH="$(go env GOPATH)/bin:$PATH"
         ./build.sh
 
     - name: Release
