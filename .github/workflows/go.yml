@@ -1,5 +1,5 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+# Go 1.21+ 不再支持 Windows 7，使用 go-legacy-win7 构建以兼容 Win7/8/8.1。
+# https://github.com/thongtech/go-legacy-win7
 
 name: Go
 
@@ -15,16 +15,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.20'
+    - name: Set up Go (legacy-win7)
+      run: |
+        GO_VERSION="1.26.4-1"
+        curl -sSfL "https://github.com/thongtech/go-legacy-win7/releases/download/v${GO_VERSION}/go-legacy-win7-${GO_VERSION}.linux_amd64.tar.gz" -o go.tar.gz
+        sudo tar -C /usr/local -xzf go.tar.gz
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
 
     - name: Build
       run: |
-        go install github.com/go-bindata/go-bindata/...@latest 
+        go install github.com/go-bindata/go-bindata/...@latest
         ./build.sh
-        
+
     - name: Release
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
