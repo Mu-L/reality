@@ -76,8 +76,8 @@ type handshakeMsg struct {
 type tlsRecord struct {
 	recordType    uint8
 	version       uint16
-	recordData    []byte           // 原始 record payload
-	handshakeMsgs []handshakeMsg   // Handshake record 时自动解析的各条握手消息
+	recordData    []byte         // 原始 record payload
+	handshakeMsgs []handshakeMsg // Handshake record 时自动解析的各条握手消息
 }
 
 func newTLSRecord(recordType uint8, version uint16, recordData []byte) *tlsRecord {
@@ -198,7 +198,7 @@ type warpConn struct {
 	net.Conn
 	aead        cipher.AEAD
 	overlayData byte
-	wSeq        [8]byte // 写计数器：TLS 1.3 隐式 nonce（读写独立，见 newWarpConn）
+	wSeq        [8]byte // 写计数器：TLS 1.3 隐式 nonce（读写独立，见 NewWarpConn）
 	rSeq        [8]byte // 读计数器
 	isTLS13     bool
 	lockRead    *sync.Mutex
@@ -207,7 +207,7 @@ type warpConn struct {
 	maxPayload  int
 }
 
-func newWarpConn(conn net.Conn, aead cipher.AEAD, overlayData byte, seq [8]byte, isTLS13 bool) *warpConn {
+func NewWarpConn(conn net.Conn, aead cipher.AEAD, overlayData byte, seq [8]byte, isTLS13 bool) *warpConn {
 	if isTLS13 {
 		seq = seqNumerOne // TLS 1.3 隐式 seq：两端各自从 seqNumerOne 独立计数
 	}

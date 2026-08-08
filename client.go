@@ -256,7 +256,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (net.Conn, error) {
 		}
 		// 服务端回复验证通过
 		logger.Debugln("verify ok")
-		return newWarpConn(uconn.GetUnderlyingConn(), aead, config.OverlayData, seqNumerOne, isTLS13), nil
+		return NewWarpConn(uconn.GetUnderlyingConn(), aead, config.OverlayData, seqNumerOne, isTLS13), nil
 	}
 	uconn.Close()
 	return nil, ErrVerifyFailed

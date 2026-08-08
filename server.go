@@ -250,7 +250,7 @@ func (l *Listener) handshake(clientConn net.Conn) (net.Conn, error) {
 	}
 
 	// [8] 返回加密连接
-	return newWarpConn(clientConn, result.aead, overlayData, seq, fo.isTLS13), nil
+	return NewWarpConn(clientConn, result.aead, overlayData, seq, fo.isTLS13), nil
 }
 
 // —— 类型定义 ——
