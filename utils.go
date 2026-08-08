@@ -50,6 +50,7 @@ func generateNonce(NonceSize int, SessionKey []byte, ExpireSecond uint32) ([]byt
 var versionTLS12 = uint16(utls.VersionTLS12)
 
 const recordHeaderLen = 5
+const explicitNonceLen = 8 // TLS 1.2 nonce_explicit 长度，计入 recordData
 const (
 	recordTypeChangeCipherSpec = 20
 	recordTypeAlert            = 21
@@ -197,7 +198,8 @@ type warpConn struct {
 	net.Conn
 	aead        cipher.AEAD
 	overlayData byte
-	seq         [8]byte
+	wSeq        [8]byte // 写计数器：TLS 1.3 隐式 nonce（读写独立，见 newWarpConn）
+	rSeq        [8]byte // 读计数器
 	isTLS13     bool
 	lockRead    *sync.Mutex
 	lockWrite   *sync.Mutex
@@ -207,17 +209,22 @@ type warpConn struct {
 
 func newWarpConn(conn net.Conn, aead cipher.AEAD, overlayData byte, seq [8]byte, isTLS13 bool) *warpConn {
 	if isTLS13 {
-		seq = seqNumerOne // TLS 1.3 隐式 seq：两端必须一致
+		seq = seqNumerOne // TLS 1.3 隐式 seq：两端各自从 seqNumerOne 独立计数
+	}
+	maxPayload := 0xFFFF - aead.Overhead() - recordHeaderLen
+	if !isTLS13 {
+		maxPayload -= explicitNonceLen
 	}
 	return &warpConn{
 		Conn:        conn,
 		lockRead:    &sync.Mutex{},
 		lockWrite:   &sync.Mutex{},
 		rawInput:    &bytes.Buffer{},
-		maxPayload:  0xFFFF - aead.Overhead() - recordHeaderLen,
+		maxPayload:  maxPayload,
 		aead:        aead,
 		overlayData: overlayData,
-		seq:         seq,
+		wSeq:        seq,
+		rSeq:        seq, // TLS 1.2 下不用（显式 nonce），置同值无副作用
 		isTLS13:     isTLS13,
 	}
 }
@@ -231,12 +238,12 @@ func (w *warpConn) Write(b []byte) (int, error) {
 		if m > w.maxPayload {
 			m = w.maxPayload
 		}
-		data := w.aead.Seal(nil, w.seq[:], b[:m], nil)
+		data := w.aead.Seal(nil, w.wSeq[:], b[:m], nil)
 		if !w.isTLS13 {
-			data = append(w.seq[:], data...) // TLS 1.2: seq 作为 nonce_explicit 传输
+			data = append(w.wSeq[:], data...) // TLS 1.2: seq 作为 nonce_explicit 传输
 		}
 		record := newTLSRecord(recordTypeApplicationData, versionTLS12, data)
-		incSeq(w.seq[:])
+		incSeq(w.wSeq[:])
 		_, err := record.writeTo(w.Conn)
 		if err != nil {
 			return wrote, err
@@ -267,21 +274,21 @@ func (w *warpConn) Read(b []byte) (int, error) {
 	data := record.recordData
 	var nonce, ciphertext []byte
 	if w.isTLS13 {
-		nonce = w.seq[:]
+		nonce = w.rSeq[:]
 		ciphertext = data
 	} else {
-		if len(data) < 8 {
+		if len(data) < explicitNonceLen {
 			return 0, ErrDecryptFailed
 		}
-		nonce = data[:8]
-		ciphertext = data[8:]
+		nonce = data[:explicitNonceLen]
+		ciphertext = data[explicitNonceLen:]
 	}
 	plaintext, err := w.aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return 0, err
 	}
 	if w.isTLS13 {
-		incSeq(w.seq[:])
+		incSeq(w.rSeq[:])
 	}
 	n := copy(b, plaintext)
 	if n < len(plaintext) {
