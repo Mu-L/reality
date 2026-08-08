@@ -2,6 +2,7 @@ package reality
 
 import (
 	"bytes"
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
@@ -31,6 +32,11 @@ var Prefix = []byte("REALITY")
 const DefaultExpireSecond = 30
 
 var seqNumerOne = [8]byte{0, 0, 0, 0, 0, 0, 0, 1}
+
+var (
+	clientWriteKeyInfo = []byte("warp client write key")
+	serverWriteKeyInfo = []byte("warp server write key")
+)
 
 // generateNonce 根据SessionKey和ExpireSecond生成Nonce
 func generateNonce(NonceSize int, SessionKey []byte, ExpireSecond uint32) ([]byte, error) {
@@ -196,7 +202,8 @@ var _ OverlayData = (*warpConn)(nil)
 
 type warpConn struct {
 	net.Conn
-	aead        cipher.AEAD
+	writeAEAD   cipher.AEAD
+	readAEAD    cipher.AEAD
 	overlayData byte
 	wSeq        [8]byte // 写计数器：TLS 1.3 隐式 nonce（读写独立，见 NewWarpConn）
 	rSeq        [8]byte // 读计数器
@@ -207,11 +214,38 @@ type warpConn struct {
 	maxPayload  int
 }
 
-func NewWarpConn(conn net.Conn, aead cipher.AEAD, overlayData byte, seq [8]byte, isTLS13 bool) *warpConn {
+func newWarpAEADs(sessionKey []byte, isClient bool) (cipher.AEAD, cipher.AEAD, error) {
+	clientAEAD, err := newWarpAEAD(sessionKey, clientWriteKeyInfo)
+	if err != nil {
+		return nil, nil, err
+	}
+	serverAEAD, err := newWarpAEAD(sessionKey, serverWriteKeyInfo)
+	if err != nil {
+		return nil, nil, err
+	}
+	if isClient {
+		return clientAEAD, serverAEAD, nil
+	}
+	return serverAEAD, clientAEAD, nil
+}
+
+func newWarpAEAD(sessionKey, info []byte) (cipher.AEAD, error) {
+	key := make([]byte, len(sessionKey))
+	if _, err := io.ReadFull(hkdf.New(sha256.New, sessionKey, Prefix, info), key); err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCMWithNonceSize(block, explicitNonceLen)
+}
+
+func NewWarpConn(conn net.Conn, writeAEAD, readAEAD cipher.AEAD, overlayData byte, seq [8]byte, isTLS13 bool) *warpConn {
 	if isTLS13 {
 		seq = seqNumerOne // TLS 1.3 隐式 seq：两端各自从 seqNumerOne 独立计数
 	}
-	maxPayload := 0xFFFF - aead.Overhead() - recordHeaderLen
+	maxPayload := 0xFFFF - writeAEAD.Overhead() - recordHeaderLen
 	if !isTLS13 {
 		maxPayload -= explicitNonceLen
 	}
@@ -221,7 +255,8 @@ func NewWarpConn(conn net.Conn, aead cipher.AEAD, overlayData byte, seq [8]byte,
 		lockWrite:   &sync.Mutex{},
 		rawInput:    &bytes.Buffer{},
 		maxPayload:  maxPayload,
-		aead:        aead,
+		writeAEAD:   writeAEAD,
+		readAEAD:    readAEAD,
 		overlayData: overlayData,
 		wSeq:        seq,
 		rSeq:        seq, // TLS 1.2 下不用（显式 nonce），置同值无副作用
@@ -238,7 +273,7 @@ func (w *warpConn) Write(b []byte) (int, error) {
 		if m > w.maxPayload {
 			m = w.maxPayload
 		}
-		data := w.aead.Seal(nil, w.wSeq[:], b[:m], nil)
+		data := w.writeAEAD.Seal(nil, w.wSeq[:], b[:m], nil)
 		if !w.isTLS13 {
 			data = append(w.wSeq[:], data...) // TLS 1.2: seq 作为 nonce_explicit 传输
 		}
@@ -283,7 +318,7 @@ func (w *warpConn) Read(b []byte) (int, error) {
 		nonce = data[:explicitNonceLen]
 		ciphertext = data[explicitNonceLen:]
 	}
-	plaintext, err := w.aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := w.readAEAD.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return 0, err
 	}

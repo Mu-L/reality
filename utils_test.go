@@ -50,8 +50,10 @@ func newTestAEAD(t *testing.T) cipher.AEAD {
 func TestWarpConnTLS13BidirectionalWriteBeforeRead(t *testing.T) {
 	clientWire := &memoryConn{}
 	serverWire := &memoryConn{}
-	client := reality.NewWarpConn(clientWire, newTestAEAD(t), 0, firstSequenceNumber, true)
-	server := reality.NewWarpConn(serverWire, newTestAEAD(t), 0, firstSequenceNumber, true)
+	clientWriteAEAD := newTestAEAD(t)
+	serverWriteAEAD := newTestAEAD(t)
+	client := reality.NewWarpConn(clientWire, clientWriteAEAD, serverWriteAEAD, 0, firstSequenceNumber, true)
+	server := reality.NewWarpConn(serverWire, serverWriteAEAD, clientWriteAEAD, 0, firstSequenceNumber, true)
 
 	clientPayload := []byte("client payload")
 	serverPayload := []byte("server payload")
@@ -84,7 +86,8 @@ func TestWarpConnTLS13BidirectionalWriteBeforeRead(t *testing.T) {
 
 func TestWarpConnTLS12MaximumRecordLength(t *testing.T) {
 	wire := &memoryConn{}
-	writer := reality.NewWarpConn(wire, newTestAEAD(t), 0, firstSequenceNumber, false)
+	aead := newTestAEAD(t)
+	writer := reality.NewWarpConn(wire, aead, aead, 0, firstSequenceNumber, false)
 	payload := bytes.Repeat([]byte{0x5a}, 0xFFFF-16-tlsRecordHeaderLen)
 	if _, err := writer.Write(payload); err != nil {
 		t.Fatal(err)
@@ -104,7 +107,7 @@ func TestWarpConnTLS12MaximumRecordLength(t *testing.T) {
 	}
 
 	wire.receive(raw)
-	reader := reality.NewWarpConn(wire, newTestAEAD(t), 0, firstSequenceNumber, false)
+	reader := reality.NewWarpConn(wire, aead, aead, 0, firstSequenceNumber, false)
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(reader, got); err != nil {
 		t.Fatal(err)

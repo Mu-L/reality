@@ -250,14 +250,19 @@ func (l *Listener) handshake(clientConn net.Conn) (net.Conn, error) {
 	}
 
 	// [8] 返回加密连接
-	return NewWarpConn(clientConn, result.aead, overlayData, seq, fo.isTLS13), nil
+	writeAEAD, readAEAD, err := newWarpAEADs(result.sessionKey, false)
+	if err != nil {
+		clientConn.Close()
+		return nil, err
+	}
+	return NewWarpConn(clientConn, writeAEAD, readAEAD, overlayData, seq, fo.isTLS13), nil
 }
 
 // —— 类型定义 ——
 
 type handshakeResult struct {
-	aead      cipher.AEAD
-	plaintext []byte
+	sessionKey []byte
+	plaintext  []byte
 }
 
 type flightObserver struct {
@@ -379,7 +384,7 @@ func (l *Listener) readClientHello(clientReader *bufio.Reader, logger logrus.Fie
 		return nil, err
 	}
 	logger.Debug("handshake ok")
-	return &handshakeResult{aead: aead, plaintext: plaintext}, nil
+	return &handshakeResult{sessionKey: sessionKey, plaintext: plaintext}, nil
 }
 
 // cleanupSeenRandoms 定期清理已过期的公钥记录，防止 map 无限增长。
